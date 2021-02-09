@@ -2,10 +2,6 @@ name: Tmp
 
 on:
   push:
-    branches: [master]
-    tags: [v*]
-  pull_request:
-    branches: [master]
 
 
 jobs:
@@ -15,7 +11,7 @@ jobs:
     steps:
     - name: Job status
       run: |
-        echo ${{ toJson(env) }} ${{ job.status }}
+        echo '${ { toJson(env) }} ${{ job.status }}'
     - name: Dump GitHub context
       env:
         GITHUB_CONTEXT: ${{ toJson(github) }}
