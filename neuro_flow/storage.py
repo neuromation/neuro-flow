@@ -90,6 +90,7 @@ class Bake:
     # prefix -> { id -> deps }
     graphs: Mapping[FullID, Mapping[FullID, AbstractSet[FullID]]]
     params: Optional[Mapping[str, str]]
+    name: Optional[str]
 
     def __str__(self) -> str:
         folder = "_".join([self.batch, _dt2str(self.when), self.suffix])
@@ -177,6 +178,7 @@ class Storage(abc.ABC):
             suffix="suffix",
             graphs={},
             params={},
+            name=None,
         )
         yield bake
 
@@ -189,6 +191,7 @@ class Storage(abc.ABC):
         configs: Sequence[ConfigFile],
         graphs: Mapping[FullID, Mapping[FullID, AbstractSet[FullID]]],
         params: Optional[Mapping[str, str]],
+        name: Optional[str],
     ) -> Bake:
         pass
 
@@ -200,6 +203,10 @@ class Storage(abc.ABC):
 
     @abc.abstractmethod
     async def fetch_bake_by_id(self, project: str, bake_id: str) -> Bake:
+        pass
+
+    @abc.abstractmethod
+    async def fetch_bake_by_name(self, project: str, bake_name: str) -> Bake:
         pass
 
     @abc.abstractmethod
@@ -601,6 +608,7 @@ class FSStorage(Storage):
         configs: Sequence[ConfigFile],
         graphs: Mapping[FullID, Mapping[FullID, AbstractSet[FullID]]],
         params: Optional[Mapping[str, str]],
+        name: Optional[str],
     ) -> Bake:
         when = _now()
         bake = Bake(
@@ -610,6 +618,7 @@ class FSStorage(Storage):
             suffix=secrets.token_hex(3),
             graphs=graphs,
             params=params,
+            name=name,
         )
         bake_uri = _mk_bake_uri(self._fs, bake)
         await self._fs.mkdir(bake_uri, parents=True)
@@ -643,6 +652,17 @@ class FSStorage(Storage):
         url = self._fs.root / project / bake_id
         data = await self._read_json(url / "00.init.json")
         return _bake_from_json(data)
+
+    async def fetch_bake_by_name(self, project: str, name: str) -> Bake:
+        candidate: Optional[Tuple[Bake, datetime.datetime]] = None
+        async for bake in self.list_bakes(project):
+            if bake.name != name:
+                continue
+            if not candidate or candidate[1] < bake.when:
+                candidate = (bake, bake.when)
+        if candidate is None:
+            raise ResourceNotFound
+        return candidate[0]
 
     async def fetch_configs_meta(self, bake: Bake) -> Mapping[str, Any]:
         ret = await self._read_json(_mk_bake_uri(self._fs, bake) / "configs_meta.json")
@@ -1042,6 +1062,7 @@ class APIStorage(Storage):
         configs: Sequence[ConfigFile],
         graphs: Mapping[FullID, Mapping[FullID, AbstractSet[FullID]]],
         params: Optional[Mapping[str, str]],
+        name: Optional[str],
     ) -> Bake:
         prj = await self._get_project(project)
         gr = {}
@@ -1059,6 +1080,7 @@ class APIStorage(Storage):
                 "batch": batch,
                 "graphs": gr,
                 "params": params,
+                "name": name,
             },
             auth=auth,
         ) as resp:
@@ -1116,17 +1138,18 @@ class APIStorage(Storage):
         self, project: str, batch: str, when: datetime.datetime, suffix: str
     ) -> Bake:
         prj = await self._get_project(project)
+        rounded_when = _dt2str(when)
         for bake_data in self._bakes_cache.values():
             rounded = _dt2str(datetime.datetime.fromisoformat(bake_data["created_at"]))
             if (
                 bake_data["project_id"] == project
                 and bake_data["batch"] == batch
-                and rounded == _dt2str(when)
+                and rounded == rounded_when
             ):
                 return _bake_from_api_json(prj, bake_data)
 
         async for bake in self.list_bakes(project):
-            if bake.batch == batch and bake.when == when:
+            if bake.batch == batch and _dt2str(bake.when) == rounded_when:
                 return bake
 
         raise ResourceNotFound
@@ -1136,6 +1159,21 @@ class APIStorage(Storage):
         when = datetime.datetime.fromisoformat(whenstr)
 
         return await self.fetch_bake(project, batch, when, "")
+
+    async def fetch_bake_by_name(self, project: str, name: str) -> Bake:
+        prj = await self._get_project(project)
+        url = self._base_url / "api/v1/flow/bakes/by_name"
+        auth = await self._config._api_auth()
+        async with self._core.request(
+            "GET",
+            url,
+            params={"project_id": prj.id, "name": name},
+            auth=auth,
+        ) as resp:
+            bake_data = await resp.json()
+            bake = _bake_from_api_json(prj, bake_data)
+            self._bakes_cache[bake_data["id"]] = bake_data
+            return bake
 
     async def _find_bake_data(self, bake: Bake) -> Dict[str, Any]:
         # refresh cache if needed
@@ -1359,7 +1397,7 @@ class APIStorage(Storage):
             json={
                 "yaml_id": _id_to_json(st.id),
                 "attempt_id": attempt_data["id"],
-                "raw_id": None,
+                "raw_id": st.raw_id,
                 "outputs": {},
                 "state": {},
                 "statuses": [
@@ -1666,6 +1704,7 @@ def _bake_to_json(bake: Bake) -> Dict[str, Any]:
         "suffix": bake.suffix,
         "graphs": graphs,
         "params": bake.params,
+        "name": bake.name,
     }
 
 
@@ -1683,6 +1722,7 @@ def _bake_from_json(data: Dict[str, Any]) -> Bake:
         suffix=data["suffix"],
         graphs=graphs,
         params=data["params"],
+        name=data.get("name"),
     )
 
 
@@ -1706,6 +1746,7 @@ def _bake_from_api_json(project: Project, data: Dict[str, Any]) -> Bake:
         suffix=digest.hexdigest()[:6],
         graphs=graphs,
         params=data["params"],
+        name=data["name"],
     )
 
 
