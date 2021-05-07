@@ -39,7 +39,14 @@ from .batch_executor import (
 from .colored_topo_sorter import ColoredTopoSorter
 from .commands import CmdProcessor
 from .config_loader import BatchLocalCL
-from .context import EMPTY_ROOT, EarlyBatch, EarlyLocalCall, RunningBatchFlow
+from .context import (
+    EMPTY_ROOT,
+    EarlyBatch,
+    EarlyLocalCall,
+    ProjectCtx,
+    RunningBatchFlow,
+    setup_project_ctx,
+)
 from .expr import EvalError, MultiEvalError
 from .parser import ConfigDir
 from .storage import Attempt, Bake, FinishedTask, Storage
@@ -83,16 +90,21 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
         self._client = client
         self._storage = storage
         self._config_loader: Optional[BatchLocalCL] = None
-        self._project: Optional[str] = None
+        self._project: Optional[ProjectCtx] = None
         self._run_neuro_cli = make_cmd_exec(
             "neuro", global_options=encode_global_options(global_options)
         )
         self._global_options = global_options
 
     @property
-    def project(self) -> str:
+    def project_id(self) -> str:
         assert self._project is not None
-        return self._project
+        return self._project.project_id
+
+    @property
+    def project_role(self) -> Optional[str]:
+        assert self._project is not None
+        return self._project.role
 
     @property
     def config_loader(self) -> BatchLocalCL:
@@ -105,8 +117,7 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
 
     async def __aenter__(self) -> "BatchRunner":
         self._config_loader = BatchLocalCL(self._config_dir, self._client)
-        project_ast = await self._config_loader.fetch_project()
-        self._project = await project_ast.id.eval(EMPTY_ROOT)
+        self._project = await setup_project_ctx(EMPTY_ROOT, self._config_loader)
         return self
 
     async def __aexit__(
@@ -289,6 +300,7 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
             data,
             self._client,
             self._storage,
+            project_role=self.project_role,
         ) as executor:
             return await executor.run()
 
@@ -326,8 +338,7 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
                 life_span = fmt_timedelta(flow.life_span)
             else:
                 life_span = "7d"
-
-            await self._run_neuro_cli(
+            run_args = [
                 "run",
                 "--pass-config",
                 f"--life-span={life_span}",
@@ -335,28 +346,38 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
                 f"--tag=flow:{data.batch}",
                 f"--tag=bake_id:{data.get_bake_id()}",
                 f"--tag=remote_executor",
+            ]
+            project_role = self.project_role
+            if project_role is not None:
+                run_args.append(f"--share={project_role}")
+            run_args += [
                 EXECUTOR_IMAGE,
                 "neuro-flow",
                 *encode_global_options(self._global_options),
                 "--fake-workspace",
                 "execute",
                 param,
-            )
+            ]
+            await self._run_neuro_cli(*run_args)
 
     async def process(
         self,
         data: ExecutorData,
     ) -> None:
         async with BatchExecutor.create(
-            self._console, data, self._client, self._storage
+            self._console,
+            data,
+            self._client,
+            self._storage,
+            project_role=self.project_role,
         ) as executor:
             await executor.run()
 
     def get_bakes(self) -> AsyncIterator[Bake]:
-        return self._storage.list_bakes(self.project)
+        return self._storage.list_bakes(self.project_id)
 
     async def get_bake_attempt(self, bake_id: str, *, attempt_no: int = -1) -> Attempt:
-        bake = await self._storage.fetch_bake_by_id(self.project, bake_id)
+        bake = await self._storage.fetch_bake_by_id(self.project_id, bake_id)
         return await self._storage.find_attempt(bake, attempt_no)
 
     async def list_bakes(self) -> None:
@@ -366,7 +387,7 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
         table.add_column("WHEN")
 
         rows: List[Tuple[str, TaskStatus, datetime.datetime]] = []
-        async for bake in self._storage.list_bakes(self.project):
+        async for bake in self._storage.list_bakes(self.project_id):
             try:
                 attempt = await self._storage.find_attempt(bake)
             except ValueError:
@@ -402,12 +423,12 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
         table.add_column("FINISHED")
 
         try:
-            bake = await self._storage.fetch_bake_by_id(self.project, bake_id)
+            bake = await self._storage.fetch_bake_by_id(self.project_id, bake_id)
         except ResourceNotFound:
             self._console.print("[yellow]Bake not found")
             self._console.print(
                 f"Please make sure that the bake [b]{bake_id}[/b] and "
-                f"project [b]{self.project}[/b] are correct."
+                f"project [b]{self.project_id}[/b] are correct."
             )
             exit(1)
 
@@ -527,7 +548,7 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
     async def logs(
         self, bake_id: str, task_id: str, *, attempt_no: int = -1, raw: bool = False
     ) -> None:
-        bake = await self._storage.fetch_bake_by_id(self.project, bake_id)
+        bake = await self._storage.fetch_bake_by_id(self.project_id, bake_id)
         attempt = await self._storage.find_attempt(bake, attempt_no)
         started, finished = await self._storage.fetch_attempt(attempt)
         full_id = tuple(task_id.split("."))
@@ -557,7 +578,7 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
                     self._console.print(line.decode("utf-8", "replace"), end="")
 
     async def cancel(self, bake_id: str, *, attempt_no: int = -1) -> None:
-        bake = await self._storage.fetch_bake_by_id(self.project, bake_id)
+        bake = await self._storage.fetch_bake_by_id(self.project_id, bake_id)
         attempt = await self._storage.find_attempt(bake, attempt_no)
         if attempt.result in TERMINATED_TASK_STATUSES:
             raise click.BadArgumentUsage(
@@ -570,7 +591,7 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
         )
 
     async def clear_cache(self, batch: Optional[str] = None) -> None:
-        await self._storage.clear_cache(self.project, batch)
+        await self._storage.clear_cache(self.project_id, batch)
 
     async def restart(
         self,
@@ -592,7 +613,7 @@ class BatchRunner(AsyncContextManager["BatchRunner"]):
         attempt_no: int = -1,
         from_failed: bool = True,
     ) -> Tuple[ExecutorData, RunningBatchFlow]:
-        bake = await self._storage.fetch_bake_by_id(self.project, bake_id)
+        bake = await self._storage.fetch_bake_by_id(self.project_id, bake_id)
         last_attempt = await self._storage.find_attempt(bake, -1)
         attempt = await self._storage.find_attempt(bake, attempt_no)
         if attempt.result not in TERMINATED_TASK_STATUSES:
